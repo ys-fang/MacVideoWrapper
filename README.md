@@ -72,6 +72,28 @@ source venv/bin/activate
 
 詳細的打包說明請參考 [`BUILD_INSTRUCTIONS.md`](BUILD_INSTRUCTIONS.md)。
 
+## ⚠️ 疑難排解
+
+### macOS 顯示「檔案已毀損」？
+
+如果您或您的使用者在下載並解壓縮 `.app` 檔案後，雙擊運行時看到「檔案已損毀，您應該將其丟到垃圾桶」的錯誤訊息，**請放心，這不是檔案真的壞了**。
+
+這是 macOS 的 Gatekeeper 安全機制在起作用。因為此應用程式未經過蘋果官方公證，系統會阻止其運行。
+
+**解決方法：**
+
+請在終端機中執行以下指令來移除「檢疫」屬性：
+
+```bash
+# 1. 輸入指令（最後有一個空格）
+xattr -cr 
+
+# 2. 將 .app 檔案拖曳到終端機視窗中，然後按下 Enter
+# 例如： xattr -cr /Users/yourname/Downloads/影片編輯器.app
+```
+
+完成後，應用程式即可正常啟動。
+
 ## 📄 授權條款
 
 本專案採用 [MIT 授權條款](LICENSE)。
