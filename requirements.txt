@@ -1,0 +1,4 @@
+PyQt6>=6.9.0
+pillow>=10.0.0
+opencv-python>=4.8.0
+moviepy>=1.0.3 
