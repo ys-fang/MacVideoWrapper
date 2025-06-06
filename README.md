@@ -2,8 +2,7 @@
 
 一個簡單易用的桌面應用程式，可以為您的影片快速添加靜態的開頭和結尾圖片。採用序列佇列處理模式，穩定可靠。
 
-![應用程式截圖](https://raw.githubusercontent.com/your-username/your-repo-name/main/screenshot.png)
-*(請將上面的 URL 替換為您自己的截圖路徑)*
+![應用程式截圖](screenshots/screenshot.png)
 
 ---
 
