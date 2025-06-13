@@ -25,13 +25,23 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtGui import QPixmap, QFont, QColor, QImage
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QTimer
 from PIL import Image
+
+# ---- 內建 FFmpeg 設定 ----
+# 使用 imageio-ffmpeg 提供的靜態 ffmpeg，確保打包後不需另裝 FFmpeg。
+# 必須在 moviepy.editor 匯入 **之前** 設定。
+from moviepy.config import change_settings
+import imageio_ffmpeg
+
+change_settings({"FFMPEG_BINARY": imageio_ffmpeg.get_ffmpeg_exe()})
+
+# MoviePy (在設定 FFmpeg 後再匯入)
 from moviepy.editor import VideoFileClip, ImageClip, concatenate_videoclips
 
 class VideoProcessor(QThread):
     """影片處理工作線程"""
     progress = pyqtSignal(str, int)  # 工作ID和進度信號
     status = pyqtSignal(str, str)    # 工作ID和狀態信號
-    finished = pyqtSignal(str, str)  # 工作ID和輸出檔案路徑
+    job_finished = pyqtSignal(str, str)  # 工作ID和輸出檔案路徑
     error = pyqtSignal(str, str)     # 工作ID和錯誤信號
     
     def __init__(self, job_id, video_file, start_image, end_image, start_duration, end_duration, output_file):
@@ -110,7 +120,7 @@ class VideoProcessor(QThread):
             
             self.progress.emit(self.job_id, 100)
             self.status.emit(self.job_id, "處理完成！")
-            self.finished.emit(self.job_id, self.output_file)
+            self.job_finished.emit(self.job_id, self.output_file)
             
         except Exception as e:
             if not self.is_cancelled:
@@ -622,8 +632,12 @@ class VideoEditorApp(QMainWindow):
         # 連接信號
         processor.progress.connect(self.on_job_progress)
         processor.status.connect(self.on_job_status)
-        processor.finished.connect(self.on_job_finished)
+        processor.job_finished.connect(self.on_job_finished)
         processor.error.connect(self.on_job_error)
+        
+        # 當線程完成後，安全地刪除它並清理我們的狀態
+        processor.finished.connect(processor.deleteLater)
+        processor.finished.connect(lambda job_id=job_id: self.on_thread_finished(job_id))
         
         self.active_processors[job_id] = processor
         self.update_active_count()
@@ -646,14 +660,10 @@ class VideoEditorApp(QMainWindow):
         # 如果工作正在處理中
         if job_id in self.active_processors:
             self.active_processors[job_id].cancel()
-            self.active_processors[job_id].wait()  # 等待線程結束
-            del self.active_processors[job_id]
+            # The thread will terminate and on_thread_finished will be called for cleanup.
             
         if job_id in self.job_widgets:
             self.job_widgets[job_id].set_cancelled()
-            
-        self.update_active_count()
-        self.process_next_in_queue()
 
     def on_job_progress(self, job_id, progress):
         """更新工作進度"""
@@ -669,19 +679,17 @@ class VideoEditorApp(QMainWindow):
         """工作完成回調"""
         if job_id in self.job_widgets:
             self.job_widgets[job_id].set_finished(output_file)
-            
-        if job_id in self.active_processors:
-            del self.active_processors[job_id]
-            
-        self.update_active_count()
-        self.process_next_in_queue()
 
     def on_job_error(self, job_id, error_message):
         """工作錯誤回調"""
         if job_id in self.job_widgets:
             self.job_widgets[job_id].set_error(error_message)
-            
+
+    def on_thread_finished(self, job_id):
+        """一個線程已完成其執行（成功、出錯或取消）"""
         if job_id in self.active_processors:
+            # 處理器對象將由deleteLater刪除。
+            # 我們只是將其從我們的字典中刪除。
             del self.active_processors[job_id]
             
         self.update_active_count()
