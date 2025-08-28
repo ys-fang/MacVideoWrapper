@@ -18,86 +18,64 @@
 - **深色主題**: 現代化的深色 UI。
 - **跨平台**: 使用 PyQt6 和 Python，理論上可在多平台運行 (主要在 macOS 上開發與測試)。
 
-## 🛠️ 安裝與設置
+## 🛠️ 環境需求
 
-您需要先安裝 **Python 3.8+** 和 **FFmpeg**。
+- macOS 12 以上（Apple Silicon/arm64）
+- Python 3.10+（僅在開發/打包機器上需要）
+- 不需要使用者安裝系統 FFmpeg（我們會內嵌）
 
-```bash
-# 在 macOS 上使用 Homebrew 安裝 FFmpeg
-brew install ffmpeg
-```
-
-然後，請依照以下步驟設置專案：
+## 🚀 開發模式執行
 
 ```bash
-# 1. 克隆此儲存庫
-git clone https://github.com/your-username/your-repo-name.git
-cd your-repo-name
-
-# 2. 建立並啟動虛擬環境 (推薦)
+# 建議使用虛擬環境
 ./setup.sh
-
-# 3. 虛擬環境將被啟動，並安裝所有必要的 Python 依賴
-# 如果您需要手動啟動：
-source venv/bin/activate
-```
-
-## 🚀 如何運行
-
-確保您已在虛擬環境中，然後執行：
-
-```bash
-./run.sh
-```
-或
-```bash
-python video_wrapper.py
-```
-
-## 📦 如何打包成獨立應用程式
-
-本專案包含打包腳本，可以將應用程式打包成獨立的 macOS 應用程式 (`.app`) 或單一執行檔。
-
-```bash
-# 確保在虛擬環境中
 source venv/bin/activate
 
-# 執行打包腳本
-./build_app.sh
-
-# 這會使用 PyInstaller 在 dist/ 目錄下生成兩種版本：
-# 1. dist/影片編輯器.app (macOS 應用程式包)
-# 2. dist/影片編輯器_單一檔案 (單一執行檔)
+# 執行
+python video_wrapper2.py
 ```
 
-詳細的打包說明請參考 [`BUILD_INSTRUCTIONS.md`](BUILD_INSTRUCTIONS.md)。
+## 📦 打包為可獨立運作的 macOS .app
 
-## ⚠️ 疑難排解
+我們提供了新的打包流程（v2）：
 
-### macOS 顯示「檔案已毀損」？
+1. 準備內嵌 FFmpeg/FFprobe（arm64）
+   - 將已編譯好的 ffmpeg/ffprobe 放到：
+     - `assets/bin/mac/arm64/ffmpeg`
+     - `assets/bin/mac/arm64/ffprobe`
+   - 並確保具有執行權限：
+     ```bash
+     chmod +x assets/bin/mac/arm64/ffmpeg assets/bin/mac/arm64/ffprobe
+     ```
 
-如果您或您的使用者在下載並解壓縮 `.app` 檔案後，雙擊運行時看到「檔案已損毀，您應該將其丟到垃圾桶」的錯誤訊息，**請放心，這不是檔案真的壞了**。
+2. 建立 .app
+   ```bash
+   source venv/bin/activate
+   ./build_v2.sh
+   ```
+   - 完成後，輸出位於：`dist/影片編輯器.app`
 
-這是 macOS 的 Gatekeeper 安全機制在起作用。因為此應用程式未經過蘋果官方公證，系統會阻止其運行。
+3. 若 macOS 阻擋啟動（未公證），可移除檔案檢疫屬性：
+   ```bash
+   xattr -cr /path/to/dist/影片編輯器.app
+   ```
 
-**解決方法：**
+### v2 流程重點
+- 程式在啟動時會優先尋找內嵌的 `assets/bin/mac/arm64/{ffmpeg,ffprobe}`；找不到才回退到系統路徑。
+- `.spec` 檔已收打包 `assets/` 目錄（包含圖示與內嵌 ffmpeg/ffprobe）。
+- 提供 `build_v2.sh` 腳本自動完成清理與打包。
 
-請在終端機中執行以下指令來移除「檢疫」屬性：
+## 🔧 疑難排解
 
-```bash
-# 1. 輸入指令（最後有一個空格）
-xattr -cr 
+- 啟動失敗顯示缺少 Qt 平台外掛：請確認 `build_v2.sh` 由 `.spec` 打包的 `.app`，不要直接拷貝未完整的建置輸出。
+- 無法呼叫 ffmpeg：請確認 `assets/bin/mac/arm64/ffmpeg` 與 `ffprobe` 存在且有執行權限。
+- Gatekeeper 提示「檔案已毀損」：請執行 `xattr -cr`（如上）。
 
-# 2. 將 .app 檔案拖曳到終端機視窗中，然後按下 Enter
-# 例如： xattr -cr /Users/yourname/Downloads/影片編輯器.app
-```
+## 📄 授權與第三方元件
 
-完成後，應用程式即可正常啟動。
+- 專案本身採用 [MIT 授權](LICENSE)。
+- 若內嵌 FFmpeg，請遵守其授權（LGPL/GPL）並於內部散佈時保留相應授權與來源資訊。
 
-## 📄 授權條款
+## 🙌 貢獻
 
-本專案採用 [MIT 授權條款](LICENSE)。
-
-## 🙌 如何貢獻
-
-歡迎任何形式的貢獻！如果您有好的想法或發現了問題，請隨時開一個 Issue 或提交 Pull Request。 
+歡迎任何形式的貢獻！如果您有好的想法或發現了問題，請開 Issue 或提交 Pull Request。 
