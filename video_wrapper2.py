@@ -18,16 +18,19 @@ from datetime import datetime
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QFileDialog, QVBoxLayout, QHBoxLayout,
-    QGroupBox, QDoubleSpinBox, QTextEdit, QProgressBar, QMessageBox, QCheckBox, QScrollArea, QFrame, QSplitter
+    QGroupBox, QDoubleSpinBox, QTextEdit, QProgressBar, QMessageBox, QCheckBox, QScrollArea, QFrame, QSplitter,
+    QListView, QStyledItemDelegate, QMenu, QStyle
 )
-from PyQt6.QtGui import QPixmap, QFont, QImage
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QPixmap, QFont, QImage, QPainter, QColor, QPen, QBrush, QFontMetrics
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QAbstractListModel, QModelIndex, QSize
 
 
 class FFmpegEnv:
     def __init__(self):
-        self.ffmpeg_path = self._find_binary('FFMPEG_BIN', ['ffmpeg', '/opt/homebrew/bin/ffmpeg', '/usr/local/bin/ffmpeg'])
-        self.ffprobe_path = self._find_binary('FFPROBE_BIN', ['ffprobe', '/opt/homebrew/bin/ffprobe', '/usr/local/bin/ffprobe'])
+        embedded_ffmpeg_candidates = self._embedded_candidates('ffmpeg')
+        embedded_ffprobe_candidates = self._embedded_candidates('ffprobe')
+        self.ffmpeg_path = self._find_binary('FFMPEG_BIN', embedded_ffmpeg_candidates + ['ffmpeg', '/opt/homebrew/bin/ffmpeg', '/usr/local/bin/ffmpeg'])
+        self.ffprobe_path = self._find_binary('FFPROBE_BIN', embedded_ffprobe_candidates + ['ffprobe', '/opt/homebrew/bin/ffprobe', '/usr/local/bin/ffprobe'])
         self.hardware_encoders = self._detect_hardware_encoders()
 
     def _find_binary(self, env_key, candidates):
@@ -42,6 +45,45 @@ class FFmpegEnv:
             except Exception:
                 continue
         return candidates[0]
+
+    def _app_base_dir(self):
+        # PyInstaller 打包後：有 sys._MEIPASS；.app 中通常在 Contents/MacOS
+        try:
+            if hasattr(sys, '_MEIPASS') and sys._MEIPASS:
+                return sys._MEIPASS
+        except Exception:
+            pass
+        # frozen one-dir 下，sys.executable 指向可執行檔
+        try:
+            if getattr(sys, 'frozen', False):
+                return os.path.dirname(os.path.abspath(sys.executable))
+        except Exception:
+            pass
+        # 開發模式：以此檔所在目錄為基準
+        try:
+            return os.path.dirname(os.path.abspath(__file__))
+        except Exception:
+            return os.getcwd()
+
+    def _embedded_candidates(self, bin_name):
+        base = self._app_base_dir()
+        candidates = []
+        # 優先：assets/bin/mac/arm64
+        candidates.append(os.path.join(base, 'assets', 'bin', 'mac', 'arm64', bin_name))
+        # 次要：assets/bin
+        candidates.append(os.path.join(base, 'assets', 'bin', bin_name))
+        # 有些佈局可能把資源放到 Resources 或 _internal；一併嘗試。
+        # .app 內從 MacOS/ 退回到 Contents/
+        app_contents = os.path.abspath(os.path.join(base, '..'))
+        resources_dir = os.path.join(app_contents, 'Resources')
+        internal_dir = os.path.join(app_contents, '_internal')
+        candidates.append(os.path.join(resources_dir, 'assets', 'bin', 'mac', 'arm64', bin_name))
+        candidates.append(os.path.join(resources_dir, 'assets', 'bin', bin_name))
+        candidates.append(os.path.join(internal_dir, 'assets', 'bin', 'mac', 'arm64', bin_name))
+        candidates.append(os.path.join(internal_dir, 'assets', 'bin', bin_name))
+        # 僅返回存在或可執行的路徑優先，其餘也保留以便 _find_binary 嘗試
+        # 這裡不過濾，交由 _find_binary 一次測試 -version 判斷
+        return candidates
 
     def _detect_hardware_encoders(self):
         enc = []
@@ -436,6 +478,151 @@ class JobWidget(QFrame):
             subprocess.run(["open", "-R", self.output_file])
 
 
+class JobItem:
+    def __init__(self, job_id: str, name: str):
+        self.job_id = job_id
+        self.name = name
+        self.status_text = "佇列中"
+        self.progress = 0
+        self.state = "queued"  # queued|running|done|error|cancel
+        self.output_file = None
+        self.started_at = datetime.now()
+
+
+class JobListModel(QAbstractListModel):
+    def __init__(self):
+        super().__init__()
+        self.items: list[JobItem] = []
+
+    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return len(self.items)
+
+    def data(self, index: QModelIndex, role: int):
+        if not index.isValid():
+            return None
+        item = self.items[index.row()]
+        if role == Qt.ItemDataRole.DisplayRole:
+            return item.name
+        if role == Qt.ItemDataRole.UserRole:
+            return item
+        return None
+
+    # convenience
+    def add_item(self, item: JobItem):
+        self.beginInsertRows(QModelIndex(), len(self.items), len(self.items))
+        self.items.append(item)
+        self.endInsertRows()
+
+    def find_row_by_id(self, job_id: str) -> int:
+        for i, it in enumerate(self.items):
+            if it.job_id == job_id:
+                return i
+        return -1
+
+    def update_progress(self, job_id: str, progress: int, status: str | None = None):
+        row = self.find_row_by_id(job_id)
+        if row < 0:
+            return
+        item = self.items[row]
+        item.progress = progress
+        if status is not None:
+            item.status_text = status
+        if progress >= 100:
+            item.state = "done"
+        top_left = self.index(row, 0)
+        self.dataChanged.emit(top_left, top_left)
+
+    def set_state(self, job_id: str, state: str, status: str | None = None, output_file: str | None = None):
+        row = self.find_row_by_id(job_id)
+        if row < 0:
+            return
+        item = self.items[row]
+        item.state = state
+        if status is not None:
+            item.status_text = status
+        if output_file:
+            item.output_file = output_file
+        top_left = self.index(row, 0)
+        self.dataChanged.emit(top_left, top_left)
+
+    def remove_row(self, row: int):
+        if row < 0 or row >= len(self.items):
+            return
+        self.beginRemoveRows(QModelIndex(), row, row)
+        del self.items[row]
+        self.endRemoveRows()
+
+
+class JobItemDelegate(QStyledItemDelegate):
+    ROW_HEIGHT = 56
+    def sizeHint(self, option, index):
+        return QSize(option.rect.width(), self.ROW_HEIGHT)
+
+    def paint(self, painter: QPainter, option, index):
+        item: JobItem = index.data(Qt.ItemDataRole.UserRole)
+        if not item:
+            return super().paint(painter, option, index)
+
+        rect = option.rect
+        painter.save()
+
+        # 背景
+        bg = QColor(42, 42, 42)
+        if option.state & QStyle.StateFlag.State_MouseOver:
+            bg = QColor(48, 48, 48)
+        painter.fillRect(rect, bg)
+
+        # 左側狀態點
+        dot_map = {
+            "queued": QColor(120,120,120),
+            "running": QColor(33,150,243),
+            "done": QColor(76,175,80),
+            "error": QColor(244,67,54),
+            "cancel": QColor(255,152,0),
+        }
+        dot_color = dot_map.get(item.state, QColor(120,120,120))
+        dot_r = 6
+        cx = rect.left() + 12
+        cy = rect.top() + rect.height()//2
+        painter.setBrush(QBrush(dot_color))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawEllipse(cx - dot_r, cy - dot_r, dot_r*2, dot_r*2)
+
+        # 文字區域
+        left = cx + 10 + dot_r
+        right_padding = 8
+        text_rect = rect.adjusted(left, 6, -right_padding, -18)
+        sub_rect = rect.adjusted(left, 24, -right_padding, -6)
+
+        painter.setPen(QPen(QColor(240,240,240)))
+        fm = QFontMetrics(painter.font())
+        name_text = fm.elidedText(item.name, Qt.TextElideMode.ElideMiddle, text_rect.width())
+        painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter, name_text)
+
+        painter.setPen(QPen(QColor(170,170,170)))
+        painter.setFont(QFont(painter.font().family(), 10))
+        painter.drawText(sub_rect, Qt.AlignmentFlag.AlignVCenter,
+                         f"{item.status_text}  •  {item.progress}%")
+
+        # 進度條（底部極細）
+        bar_h = 3
+        bar_rect = rect.adjusted(left, rect.height()-bar_h-4, -right_padding, -4)
+        track = QColor(60,60,60)
+        painter.fillRect(bar_rect, track)
+        if item.progress > 0:
+            if item.state == "done":
+                chunk = QColor(76,175,80)
+            elif item.state == "error":
+                chunk = QColor(244,67,54)
+            elif item.state == "cancel":
+                chunk = QColor(255,152,0)
+            else:
+                chunk = QColor(0,120,212)
+            w = max(0, int(bar_rect.width() * max(0, min(item.progress, 100)) / 100))
+            painter.fillRect(bar_rect.adjusted(0,0, -(bar_rect.width()-w), 0), chunk)
+
+        painter.restore()
+
 class DropZone(QFrame):
     filesDropped = pyqtSignal(list)
 
@@ -653,16 +840,19 @@ class VideoEditorFFApp(QMainWindow):
         header_layout.addWidget(self.pending_count_label)
         right_layout.addLayout(header_layout)
 
-        self.jobs_scroll = QScrollArea()
-        self.jobs_scroll.setWidgetResizable(True)
-        self.jobs_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-
-        self.jobs_container = QWidget()
-        self.jobs_layout = QVBoxLayout(self.jobs_container)
-        self.jobs_layout.addStretch()
-
-        self.jobs_scroll.setWidget(self.jobs_container)
-        right_layout.addWidget(self.jobs_scroll)
+        # 使用 QListView + Model/Delegate
+        self.jobs_view = QListView()
+        self.jobs_view.setUniformItemSizes(True)
+        self.jobs_view.setMouseTracking(True)
+        self.jobs_view.setSelectionMode(QListView.SelectionMode.SingleSelection)
+        self.jobs_model = JobListModel()
+        self.jobs_delegate = JobItemDelegate(self.jobs_view)
+        self.jobs_view.setModel(self.jobs_model)
+        self.jobs_view.setItemDelegate(self.jobs_delegate)
+        self.jobs_view.doubleClicked.connect(self.on_jobs_double_clicked)
+        self.jobs_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.jobs_view.customContextMenuRequested.connect(self.on_jobs_context_menu)
+        right_layout.addWidget(self.jobs_view)
 
         clear_all_btn = QPushButton("清除所有完成的工作")
         clear_all_btn.clicked.connect(self.clear_finished_jobs)
@@ -1059,10 +1249,9 @@ class VideoEditorFFApp(QMainWindow):
 
         job_id = str(uuid.uuid4())
         job_name = os.path.basename(self.video_file)
-        job_widget = JobWidget(job_id, job_name)
-        job_widget.cancel_requested.connect(self.cancel_job)
-        self.jobs_layout.insertWidget(self.jobs_layout.count() - 1, job_widget)
-        self.job_widgets[job_id] = job_widget
+        # 新列表模型加入項目
+        job_item = JobItem(job_id, job_name)
+        self.jobs_model.add_item(job_item)
 
         # 若勾選同圖，確保結尾路徑帶入
         if hasattr(self, 'same_image_checkbox') and self.same_image_checkbox.isChecked():
@@ -1082,8 +1271,7 @@ class VideoEditorFFApp(QMainWindow):
         }
 
         self.job_queue.append(processor_args)
-        job_widget.update_status("已加入佇列...")
-        job_widget.status_label.setStyleSheet("color: #ffc107; font-size: 10px;")
+        self.jobs_model.set_state(job_id, "queued", "已加入佇列…")
         self.update_queue_count()
         self.process_next_in_queue()
         # 非阻塞提示：狀態列訊息
@@ -1098,9 +1286,9 @@ class VideoEditorFFApp(QMainWindow):
 
         processor_args = self.job_queue.pop(0)
         job_id = processor_args['job_id']
-        if job_id not in self.job_widgets:
-            self.process_next_in_queue()
-            return
+        # 若模型中找不到相對應項目，仍繼續處理（只是不顯示）
+        if self.jobs_model.find_row_by_id(job_id) < 0:
+            pass
 
         processor = FFmpegWrapperProcessor(**processor_args)
         processor.progress.connect(self.on_job_progress)
@@ -1119,32 +1307,34 @@ class VideoEditorFFApp(QMainWindow):
         job_in_queue = next((job for job in self.job_queue if job['job_id'] == job_id), None)
         if job_in_queue:
             self.job_queue.remove(job_in_queue)
-            if job_id in self.job_widgets:
-                self.job_widgets[job_id].set_cancelled()
+            self.jobs_model.set_state(job_id, "cancel", "已取消")
             self.update_queue_count()
             return
 
         if job_id in self.active_processors:
             self.active_processors[job_id].cancel()
-
-        if job_id in self.job_widgets:
-            self.job_widgets[job_id].set_cancelled()
+            self.jobs_model.set_state(job_id, "cancel", "取消中…")
 
     def on_job_progress(self, job_id, progress):
-        if job_id in self.job_widgets:
-            self.job_widgets[job_id].update_progress(progress)
+        row = self.jobs_model.find_row_by_id(job_id)
+        if row >= 0:
+            self.jobs_model.update_progress(job_id, progress)
 
     def on_job_status(self, job_id, status):
-        if job_id in self.job_widgets:
-            self.job_widgets[job_id].update_status(status)
+        row = self.jobs_model.find_row_by_id(job_id)
+        if row >= 0:
+            # running 狀態
+            self.jobs_model.set_state(job_id, "running", status)
 
     def on_job_finished(self, job_id, output_file):
-        if job_id in self.job_widgets:
-            self.job_widgets[job_id].set_finished(output_file)
+        row = self.jobs_model.find_row_by_id(job_id)
+        if row >= 0:
+            self.jobs_model.set_state(job_id, "done", "完成", output_file)
 
     def on_job_error(self, job_id, error_message):
-        if job_id in self.job_widgets:
-            self.job_widgets[job_id].set_error(error_message)
+        row = self.jobs_model.find_row_by_id(job_id)
+        if row >= 0:
+            self.jobs_model.set_state(job_id, "error", f"錯誤: {error_message}")
 
     def on_thread_finished(self, job_id):
         if job_id in self.active_processors:
@@ -1161,16 +1351,49 @@ class VideoEditorFFApp(QMainWindow):
         self.pending_count_label.setText(f"佇列中: {queue_count}")
 
     def clear_finished_jobs(self):
-        to_remove = []
-        for job_id, widget in self.job_widgets.items():
-            if widget.cancel_btn.isEnabled() == False:
-                to_remove.append(job_id)
-        for job_id in to_remove:
-            widget = self.job_widgets[job_id]
-            widget.setParent(None)
-            widget.deleteLater()
-            del self.job_widgets[job_id]
+        # 清除模型內已完成/取消/錯誤之項目
+        kept: list[JobItem] = []
+        for item in self.jobs_model.items:
+            if item.state == "running" or item.state == "queued":
+                kept.append(item)
+        if len(kept) != len(self.jobs_model.items):
+            self.jobs_model.beginResetModel()
+            self.jobs_model.items = kept
+            self.jobs_model.endResetModel()
 
+    # --- Jobs view interactions ---
+    def on_jobs_double_clicked(self, index: QModelIndex):
+        item: JobItem = index.data(Qt.ItemDataRole.UserRole)
+        if not item:
+            return
+        if item.state in ("running", "queued"):
+            self.cancel_job(item.job_id)
+        elif item.state == "done" and item.output_file and os.path.exists(item.output_file):
+            subprocess.run(["open", "-R", item.output_file])
+
+    def on_jobs_context_menu(self, pos):
+        index = self.jobs_view.indexAt(pos)
+        if not index.isValid():
+            return
+        item: JobItem = index.data(Qt.ItemDataRole.UserRole)
+        menu = QMenu(self)
+        if item.state in ("running", "queued"):
+            act_cancel = menu.addAction("取消")
+            act = menu.exec(self.jobs_view.mapToGlobal(pos))
+            if act == act_cancel:
+                self.cancel_job(item.job_id)
+            return
+        if item.state == "done":
+            act_open = menu.addAction("開啟檔案")
+            act_reveal = menu.addAction("在 Finder 顯示")
+            act_remove = menu.addAction("自列表移除")
+            act = menu.exec(self.jobs_view.mapToGlobal(pos))
+            if act == act_open and item.output_file and os.path.exists(item.output_file):
+                subprocess.run(["open", item.output_file])
+            elif act == act_reveal and item.output_file:
+                subprocess.run(["open", "-R", item.output_file])
+            elif act == act_remove:
+                self.jobs_model.remove_row(index.row())
     def clear_selection(self):
         self.video_file = None
         self.start_image_file = None
