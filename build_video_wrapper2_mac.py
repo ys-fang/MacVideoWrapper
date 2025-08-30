@@ -21,7 +21,7 @@ class VideoWrapper2MacBuilder:
         self.assets_dir = self.project_root / "assets"
         self.build_dir = self.project_root / "build_v2"
         self.dist_dir = self.project_root / "dist"  # 使用 PyInstaller 預設的 dist 目錄
-        self.app_name = "影片編輯器_v2"
+        self.app_name = "VideoWrapper2"
         self.app_bundle = self.dist_dir / f"{self.app_name}.app"
         
         # 清理舊的建置目錄
@@ -161,11 +161,11 @@ app = BUNDLE(
     bundle_identifier='com.videowrapper.app',
     distpath='{self.dist_dir}',  # 指定輸出目錄
     info_plist={{
-        'CFBundleName': '{self.app_name}',
-        'CFBundleDisplayName': '{self.app_name}',
-        'CFBundleVersion': '2.0.0',
-        'CFBundleShortVersionString': '2.0.0',
-        'CFBundleExecutable': '{self.app_name}',
+        'CFBundleName': 'VideoWrapper2',
+        'CFBundleDisplayName': 'VideoWrapper2',
+        'CFBundleVersion': '3.0.0',
+        'CFBundleShortVersionString': '3.0.0',
+        'CFBundleExecutable': 'VideoWrapper2',
         'CFBundleIdentifier': 'com.videowrapper.app',
         'CFBundlePackageType': 'APPL',
         'CFBundleSignature': '????',
@@ -285,7 +285,7 @@ app = BUNDLE(
     
     def build(self):
         """執行完整的建置流程"""
-        print("🚀 開始建置 影片編輯器 v2 Mac 應用程式")
+        print("🚀 開始建置 VideoWrapper2 Mac 應用程式（整合版）")
         print("=" * 60)
         
         try:
@@ -299,6 +299,8 @@ app = BUNDLE(
             print("🎉 建置完成！")
             print(f"📱 應用程式位置: {self.app_bundle}")
             print(f"💡 您可以直接雙擊執行，或拖曳到 Applications 資料夾")
+            print(f"✨ 應用程式名稱：VideoWrapper2")
+            print(f"✨ 新功能：支援單次處理與批次處理兩種模式")
             
         except Exception as e:
             print(f"❌ 建置失敗: {e}")

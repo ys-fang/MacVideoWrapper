@@ -6,6 +6,8 @@
 影片編輯器 (FFmpeg 直呼版) - 在主片前後插入靜態圖片
 優先路線A：主片免重編碼（TS 轉封 + concat -c copy）
 回退路線B：全段硬體重編碼（VideoToolbox）
+
+整合版本：支援單次處理與批次處理兩種模式
 """
 
 import sys
@@ -14,16 +16,383 @@ import json
 import subprocess
 import tempfile
 import uuid
+import glob
 from datetime import datetime
+from typing import List, Tuple, Dict, Optional
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QFileDialog, QVBoxLayout, QHBoxLayout,
     QGroupBox, QDoubleSpinBox, QTextEdit, QProgressBar, QMessageBox, QCheckBox, QScrollArea, QFrame, QSplitter,
-    QListView, QStyledItemDelegate, QMenu, QStyle
+    QListView, QStyledItemDelegate, QMenu, QStyle, QTabWidget, QListWidget, QTableWidget, QTableWidgetItem,
+    QHeaderView, QComboBox, QLineEdit
 )
 from PyQt6.QtGui import QPixmap, QFont, QImage, QPainter, QColor, QPen, QBrush, QFontMetrics
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QAbstractListModel, QModelIndex, QSize
 
+
+# ==================== 批次模式相關類別 ====================
+
+class FileMatcher:
+    """檔案匹配引擎"""
+    
+    def __init__(self):
+        self.video_extensions = ['.mp4', '.mov', '.mkv', '.avi', '.m4v']
+        self.image_extensions = ['.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff']
+    
+    def scan_videos(self, folder_path: str) -> List[str]:
+        """掃描影片檔案"""
+        videos = []
+        for ext in self.video_extensions:
+            pattern = os.path.join(folder_path, f"*{ext}")
+            videos.extend(glob.glob(pattern))
+            pattern = os.path.join(folder_path, f"*{ext.upper()}")
+            videos.extend(glob.glob(pattern))
+        return sorted(videos)
+    
+    def scan_images(self, folder_path: str) -> List[str]:
+        """掃描圖片檔案"""
+        images = []
+        for ext in self.image_extensions:
+            pattern = os.path.join(folder_path, f"*{ext}")
+            images.extend(glob.glob(pattern))
+            pattern = os.path.join(folder_path, f"*{ext.upper()}")
+            images.extend(glob.glob(pattern))
+        return sorted(images)
+    
+    def match_exact_names(self, videos: List[str], images: List[str]) -> List[Tuple[str, str]]:
+        """完全檔名匹配"""
+        matches = []
+        video_basenames = {os.path.splitext(os.path.basename(v))[0]: v for v in videos}
+        
+        for image_path in images:
+            image_basename = os.path.splitext(os.path.basename(image_path))[0]
+            if image_basename in video_basenames:
+                matches.append((video_basenames[image_basename], image_path))
+        
+        return matches
+    
+    def match_similar_names(self, videos: List[str], images: List[str]) -> List[Tuple[str, str]]:
+        """相似檔名匹配"""
+        matches = []
+        used_videos = set()
+        used_images = set()
+        
+        for video_path in videos:
+            if video_path in used_videos:
+                continue
+                
+            video_basename = os.path.splitext(os.path.basename(video_path))[0]
+            
+            # 尋找最相似的圖片
+            best_match = None
+            best_score = 0
+            
+            for image_path in images:
+                if image_path in used_images:
+                    continue
+                    
+                image_basename = os.path.splitext(os.path.basename(image_path))[0]
+                score = self.calculate_similarity(video_basename, image_basename)
+                
+                if score > best_score and score > 0.5:  # 相似度閾值
+                    best_score = score
+                    best_match = image_path
+            
+            if best_match:
+                matches.append((video_path, best_match))
+                used_videos.add(video_path)
+                used_images.add(best_match)
+        
+        return matches
+    
+    def match_sequential(self, videos: List[str], images: List[str]) -> List[Tuple[str, str]]:
+        """順序匹配"""
+        matches = []
+        min_len = min(len(videos), len(images))
+        
+        for i in range(min_len):
+            matches.append((videos[i], images[i]))
+        
+        return matches
+    
+    def calculate_similarity(self, str1: str, str2: str) -> float:
+        """計算字串相似度"""
+        if not str1 or not str2:
+            return 0.0
+        
+        # 簡單的相似度計算：共同字元比例
+        common_chars = set(str1.lower()) & set(str2.lower())
+        total_chars = set(str1.lower()) | set(str2.lower())
+        
+        if not total_chars:
+            return 0.0
+        
+        return len(common_chars) / len(total_chars)
+    
+    def scan_and_match(self, video_folder: str, image_folder: str) -> List[Tuple[str, str]]:
+        """掃描並匹配檔案"""
+        videos = self.scan_videos(video_folder)
+        images = self.scan_images(image_folder)
+        
+        if not videos or not images:
+            return []
+        
+        # 優先使用完全匹配
+        matches = self.match_exact_names(videos, images)
+        
+        # 如果完全匹配不足，使用相似匹配
+        if len(matches) < min(len(videos), len(images)):
+            remaining_videos = [v for v in videos if v not in [m[0] for m in matches]]
+            remaining_images = [i for i in images if i not in [m[1] for m in matches]]
+            matches.extend(self.match_similar_names(remaining_videos, remaining_images))
+        
+        # 最後使用順序匹配
+        if len(matches) < min(len(videos), len(images)):
+            remaining_videos = [v for v in videos if v not in [m[0] for m in matches]]
+            remaining_images = [i for i in images if i not in [m[1] for m in matches]]
+            matches.extend(self.match_sequential(remaining_videos, remaining_images))
+        
+        return matches
+
+
+class BatchJobItem:
+    """批次工作項目"""
+    
+    def __init__(self, job_id: str, video_path: str, image_path: str, output_path: str):
+        self.job_id = job_id
+        self.video_path = video_path
+        self.image_path = image_path
+        self.output_path = output_path
+        self.status = "queued"
+        self.progress = 0
+        self.error_message = None
+        self.started_at = None
+        self.completed_at = None
+
+
+class BatchManager:
+    """批次管理器"""
+    
+    def __init__(self):
+        self.batches: Dict[str, List[BatchJobItem]] = {}
+        self.current_batch_id = None
+    
+    def create_batch(self, matched_pairs: List[Tuple[str, str]], output_folder: str) -> str:
+        """建立批次工作"""
+        batch_id = str(uuid.uuid4())
+        batch_jobs = []
+        
+        for video_path, image_path in matched_pairs:
+            job_id = str(uuid.uuid4())
+            output_name = self.generate_output_name(video_path)
+            output_path = os.path.join(output_folder, output_name)
+            
+            job = BatchJobItem(job_id, video_path, image_path, output_path)
+            batch_jobs.append(job)
+        
+        self.batches[batch_id] = batch_jobs
+        self.current_batch_id = batch_id
+        return batch_id
+    
+    def get_current_batch(self) -> List[BatchJobItem]:
+        """取得當前批次"""
+        if self.current_batch_id and self.current_batch_id in self.batches:
+            return self.batches[self.current_batch_id]
+        return []
+    
+    def update_job_progress(self, job_id: str, progress: int, status: str = None, error: str = None):
+        """更新工作進度"""
+        for batch_jobs in self.batches.values():
+            for job in batch_jobs:
+                if job.job_id == job_id:
+                    job.progress = progress
+                    if status:
+                        job.status = status
+                    if error:
+                        job.error_message = error
+                    if progress >= 100:
+                        job.completed_at = datetime.now()
+                    elif progress > 0 and not job.started_at:
+                        job.started_at = datetime.now()
+                    return
+    
+    def get_batch_progress(self, batch_id: str) -> Tuple[int, int, int]:
+        """取得批次進度 (完成, 總數, 百分比)"""
+        if batch_id not in self.batches:
+            return 0, 0, 0
+        
+        batch_jobs = self.batches[batch_id]
+        total = len(batch_jobs)
+        completed = sum(1 for job in batch_jobs if job.progress >= 100)
+        percentage = int((completed / total) * 100) if total > 0 else 0
+        
+        return completed, total, percentage
+    
+    @staticmethod
+    def generate_output_name(video_path: str) -> str:
+        """產生輸出檔案名稱"""
+        base_name = os.path.splitext(os.path.basename(video_path))[0]
+        return f"{base_name}_with_images.mp4"
+
+
+class BatchPreviewWidget(QWidget):
+    """批次預覽元件"""
+    
+    def __init__(self):
+        super().__init__()
+        self.setup_ui()
+    
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        
+        # 標題
+        title = QLabel("📋 批次預覽")
+        title.setFont(QFont("Arial", 12, QFont.Weight.Bold))
+        layout.addWidget(title)
+        
+        # 預覽表格
+        self.preview_table = QTableWidget()
+        self.preview_table.setColumnCount(3)
+        self.preview_table.setHorizontalHeaderLabels(['影片檔案', '圖片檔案', '輸出檔案'])
+        
+        # 設定表格樣式
+        header = self.preview_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        
+        layout.addWidget(self.preview_table)
+        
+        # 統計資訊
+        self.stats_label = QLabel("等待掃描檔案...")
+        self.stats_label.setStyleSheet("color: #888; font-size: 12px;")
+        layout.addWidget(self.stats_label)
+    
+    def update_preview(self, matched_pairs, output_folder: str):
+        """更新批次預覽"""
+        self.preview_table.setRowCount(len(matched_pairs))
+        
+        for i, (video_path, image_path) in enumerate(matched_pairs):
+            # 影片檔案
+            video_name = os.path.basename(video_path)
+            self.preview_table.setItem(i, 0, QTableWidgetItem(video_name))
+            
+            # 圖片檔案
+            image_name = os.path.basename(image_path)
+            self.preview_table.setItem(i, 1, QTableWidgetItem(image_name))
+            
+            # 輸出檔案
+            output_name = BatchManager.generate_output_name(video_path)
+            self.preview_table.setItem(i, 2, QTableWidgetItem(output_name))
+        
+        # 更新統計
+        self.stats_label.setText(f"找到 {len(matched_pairs)} 個檔案配對")
+
+
+class BatchSettingsPanel(QWidget):
+    """批次設定面板"""
+    
+    def __init__(self, file_matcher: FileMatcher):
+        super().__init__()
+        self.file_matcher = file_matcher
+        self.video_folder = None
+        self.image_folder = None
+        self.output_folder = None
+        self.setup_ui()
+    
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+        
+        # 資料夾選擇區塊
+        folder_group = QGroupBox("📁 資料夾設定")
+        folder_layout = QVBoxLayout(folder_group)
+        
+        # 影片資料夾
+        video_layout = QHBoxLayout()
+        video_layout.addWidget(QLabel("影片資料夾:"))
+        self.video_folder_label = QLabel("未選擇")
+        self.video_folder_label.setStyleSheet("color: #888; font-style: italic;")
+        video_layout.addWidget(self.video_folder_label)
+        video_layout.addStretch()
+        
+        self.video_folder_btn = QPushButton("選擇")
+        self.video_folder_btn.clicked.connect(self.select_video_folder)
+        video_layout.addWidget(self.video_folder_btn)
+        folder_layout.addLayout(video_layout)
+        
+        # 圖片資料夾
+        image_layout = QHBoxLayout()
+        image_layout.addWidget(QLabel("圖片資料夾:"))
+        self.image_folder_label = QLabel("未選擇")
+        self.image_folder_label.setStyleSheet("color: #888; font-style: italic;")
+        image_layout.addWidget(self.image_folder_label)
+        image_layout.addStretch()
+        
+        self.image_folder_btn = QPushButton("選擇")
+        self.image_folder_btn.clicked.connect(self.select_image_folder)
+        image_layout.addWidget(self.image_folder_btn)
+        folder_layout.addLayout(image_layout)
+        
+        # 輸出資料夾
+        output_layout = QHBoxLayout()
+        output_layout.addWidget(QLabel("輸出資料夾:"))
+        self.output_folder_label = QLabel("未選擇")
+        self.output_folder_label.setStyleSheet("color: #888; font-style: italic;")
+        output_layout.addWidget(self.output_folder_label)
+        output_layout.addStretch()
+        
+        self.output_folder_btn = QPushButton("選擇")
+        self.output_folder_btn.clicked.connect(self.select_output_folder)
+        output_layout.addWidget(self.output_folder_btn)
+        folder_layout.addLayout(output_layout)
+        
+        layout.addWidget(folder_group)
+        
+        # 掃描按鈕
+        self.scan_btn = QPushButton("🔍 掃描檔案")
+        self.scan_btn.setEnabled(False)
+        self.scan_btn.clicked.connect(self.scan_files)
+        layout.addWidget(self.scan_btn)
+        
+        layout.addStretch()
+    
+    def select_video_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "選擇影片資料夾")
+        if folder:
+            self.video_folder = folder
+            self.video_folder_label.setText(os.path.basename(folder))
+            self.check_scan_ready()
+    
+    def select_image_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "選擇圖片資料夾")
+        if folder:
+            self.image_folder = folder
+            self.image_folder_label.setText(os.path.basename(folder))
+            self.check_scan_ready()
+    
+    def select_output_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "選擇輸出資料夾")
+        if folder:
+            self.output_folder = folder
+            self.output_folder_label.setText(os.path.basename(folder))
+            self.check_scan_ready()
+    
+    def check_scan_ready(self):
+        """檢查是否可以掃描"""
+        ready = bool(self.video_folder and self.image_folder and self.output_folder)
+        self.scan_btn.setEnabled(ready)
+    
+    def scan_files(self):
+        """掃描檔案"""
+        if not all([self.video_folder, self.image_folder, self.output_folder]):
+            return
+        
+        matched_pairs = self.file_matcher.scan_and_match(self.video_folder, self.image_folder)
+        return matched_pairs, self.output_folder
+
+
+# ==================== 原有類別保持不變 ====================
 
 class FFmpegEnv:
     def __init__(self):
@@ -673,13 +1042,19 @@ class DropZone(QFrame):
 class VideoEditorFFApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("影片編輯器 - FFmpeg 直呼版（序列處理）")
-        self.resize(1200, 800)
+        self.setWindowTitle("影片編輯器 - FFmpeg 直呼版（單次/批次模式）")
+        self.resize(1400, 900)
         self.setStyleSheet(self.get_dark_theme())
         self.setAcceptDrops(True)
 
         self.env = FFmpegEnv()
+        
+        # 批次模式相關
+        self.file_matcher = FileMatcher()
+        self.batch_manager = BatchManager()
+        self.current_matched_pairs = []
 
+        # 單次模式變數
         self.video_file = None
         self.start_image_file = None
         self.end_image_file = None
@@ -695,21 +1070,122 @@ class VideoEditorFFApp(QMainWindow):
 
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
-        self.main_layout = QHBoxLayout(self.central_widget)
+        self.main_layout = QVBoxLayout(self.central_widget)
 
-        self.splitter = QSplitter(Qt.Orientation.Horizontal)
-        self.main_layout.addWidget(self.splitter)
+        # 創建標籤頁
+        self.create_tab_widget()
+
+        self.update_active_count()
+        self.update_queue_count()
+
+    def create_tab_widget(self):
+        """創建標籤頁容器"""
+        self.tab_widget = QTabWidget()
+        self.main_layout.addWidget(self.tab_widget)
+        
+        # 單次模式標籤頁
+        self.single_tab = self.create_single_mode_tab()
+        self.tab_widget.addTab(self.single_tab, "🎬 單次處理")
+        
+        # 批次模式標籤頁
+        self.batch_tab = self.create_batch_mode_tab()
+        self.tab_widget.addTab(self.batch_tab, "📦 批次處理")
+
+    def create_single_mode_tab(self):
+        """創建單次模式標籤頁"""
+        tab = QWidget()
+        layout = QHBoxLayout(tab)
+        
+        self.single_splitter = QSplitter(Qt.Orientation.Horizontal)
+        layout.addWidget(self.single_splitter)
 
         self.create_left_panel()
         self.create_right_panel()
 
         # 設置分割器比例（左側更寬）
-        self.splitter.setStretchFactor(0, 3)
-        self.splitter.setStretchFactor(1, 1)
-        self.splitter.setSizes([900, 300])
+        self.single_splitter.setStretchFactor(0, 3)
+        self.single_splitter.setStretchFactor(1, 1)
+        self.single_splitter.setSizes([900, 300])
+        
+        return tab
 
-        self.update_active_count()
-        self.update_queue_count()
+    def create_batch_mode_tab(self):
+        """創建批次模式標籤頁"""
+        tab = QWidget()
+        layout = QHBoxLayout(tab)
+        
+        self.batch_splitter = QSplitter(Qt.Orientation.Horizontal)
+        layout.addWidget(self.batch_splitter)
+
+        # 左側：批次設定和預覽
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        
+        # 批次設定面板
+        self.batch_settings = BatchSettingsPanel(self.file_matcher)
+        self.batch_settings.scan_btn.clicked.connect(self.on_batch_scan)
+        left_layout.addWidget(self.batch_settings)
+        
+        # 批次預覽
+        self.batch_preview = BatchPreviewWidget()
+        left_layout.addWidget(self.batch_preview)
+        
+        # 批次處理按鈕
+        self.batch_process_btn = QPushButton("🚀 開始批次處理")
+        self.batch_process_btn.setObjectName("PrimaryCTA")
+        self.batch_process_btn.setEnabled(False)
+        self.batch_process_btn.clicked.connect(self.start_batch_processing)
+        # 直接設定樣式
+        self.apply_primary_button_style(self.batch_process_btn)
+        left_layout.addWidget(self.batch_process_btn)
+        
+        self.batch_splitter.addWidget(left_widget)
+        
+        # 右側：工作佇列（共用原有的）
+        self.create_batch_right_panel()
+        
+        # 設置分割器比例
+        self.batch_splitter.setStretchFactor(0, 2)
+        self.batch_splitter.setStretchFactor(1, 1)
+        self.batch_splitter.setSizes([800, 400])
+        
+        return tab
+
+    def create_batch_right_panel(self):
+        """創建批次模式右側面板"""
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+
+        header_layout = QHBoxLayout()
+        title = QLabel("批次處理工作列表")
+        title.setFont(QFont("Arial", 14, QFont.Weight.Bold))
+        self.batch_active_count_label = QLabel("進行中: 0")
+        self.batch_active_count_label.setStyleSheet("color: #4caf50; font-size: 12px;")
+        self.batch_pending_count_label = QLabel("佇列中: 0")
+        self.batch_pending_count_label.setStyleSheet("color: #ff9800; font-size: 12px;")
+        header_layout.addWidget(title)
+        header_layout.addStretch()
+        header_layout.addWidget(self.batch_active_count_label)
+        header_layout.addWidget(self.batch_pending_count_label)
+        right_layout.addLayout(header_layout)
+
+        # 使用 QListView + Model/Delegate（共用原有的）
+        self.batch_jobs_view = QListView()
+        self.batch_jobs_view.setUniformItemSizes(True)
+        self.batch_jobs_view.setMouseTracking(True)
+        self.batch_jobs_view.setSelectionMode(QListView.SelectionMode.SingleSelection)
+        self.batch_jobs_view.setModel(self.jobs_model)  # 共用模型
+        self.batch_jobs_view.setItemDelegate(self.jobs_delegate)  # 共用委託
+        self.batch_jobs_view.doubleClicked.connect(self.on_jobs_double_clicked)
+        self.batch_jobs_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.batch_jobs_view.customContextMenuRequested.connect(self.on_jobs_context_menu)
+        right_layout.addWidget(self.batch_jobs_view)
+
+        clear_all_btn = QPushButton("清除所有完成的工作")
+        clear_all_btn.clicked.connect(self.clear_finished_jobs)
+        right_layout.addWidget(clear_all_btn)
+
+        self.batch_splitter.addWidget(right_widget)
 
     def get_dark_theme(self):
         return """
@@ -821,7 +1297,7 @@ class VideoEditorFFApp(QMainWindow):
         left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         left_scroll.setWidget(left_widget)
 
-        self.splitter.addWidget(left_scroll)
+        self.single_splitter.addWidget(left_scroll)
 
     def create_right_panel(self):
         right_widget = QWidget()
@@ -858,7 +1334,7 @@ class VideoEditorFFApp(QMainWindow):
         clear_all_btn.clicked.connect(self.clear_finished_jobs)
         right_layout.addWidget(clear_all_btn)
 
-        self.splitter.addWidget(right_widget)
+        self.single_splitter.addWidget(right_widget)
 
     def create_files_column(self):
         """左欄：檔案選擇"""
@@ -1319,28 +1795,54 @@ class VideoEditorFFApp(QMainWindow):
         row = self.jobs_model.find_row_by_id(job_id)
         if row >= 0:
             self.jobs_model.update_progress(job_id, progress)
+        
+        # 同時更新批次管理器
+        if hasattr(self, 'batch_manager'):
+            self.batch_manager.update_job_progress(job_id, progress)
 
     def on_job_status(self, job_id, status):
         row = self.jobs_model.find_row_by_id(job_id)
         if row >= 0:
             # running 狀態
             self.jobs_model.set_state(job_id, "running", status)
+        
+        # 同時更新批次管理器
+        if hasattr(self, 'batch_manager'):
+            self.batch_manager.update_job_progress(job_id, 0, status)
 
     def on_job_finished(self, job_id, output_file):
         row = self.jobs_model.find_row_by_id(job_id)
         if row >= 0:
             self.jobs_model.set_state(job_id, "done", "完成", output_file)
+        
+        # 同時更新批次管理器
+        if hasattr(self, 'batch_manager'):
+            self.batch_manager.update_job_progress(job_id, 100, "完成")
 
     def on_job_error(self, job_id, error_message):
         row = self.jobs_model.find_row_by_id(job_id)
         if row >= 0:
             self.jobs_model.set_state(job_id, "error", f"錯誤: {error_message}")
+        
+        # 同時更新批次管理器
+        if hasattr(self, 'batch_manager'):
+            self.batch_manager.update_job_progress(job_id, 0, "錯誤", error_message)
 
     def on_thread_finished(self, job_id):
         if job_id in self.active_processors:
             del self.active_processors[job_id]
         self.update_active_count()
         self.process_next_in_queue()
+        
+        # 檢查批次處理是否完成
+        if hasattr(self, 'batch_manager') and self.batch_manager.current_batch_id:
+            batch_jobs = self.batch_manager.get_current_batch()
+            completed_count = sum(1 for job in batch_jobs if job.progress >= 100)
+            if completed_count == len(batch_jobs) and len(batch_jobs) > 0:
+                # 批次處理完成
+                self.batch_process_btn.setEnabled(True)
+                self.batch_process_btn.setText("🚀 開始批次處理")
+                # 移除確認對話窗，讓操作更流暢
 
     def update_active_count(self):
         active_count = len(self.active_processors)
@@ -1349,6 +1851,16 @@ class VideoEditorFFApp(QMainWindow):
     def update_queue_count(self):
         queue_count = len(self.job_queue)
         self.pending_count_label.setText(f"佇列中: {queue_count}")
+        # 同時更新批次模式的標籤
+        if hasattr(self, 'batch_pending_count_label'):
+            self.batch_pending_count_label.setText(f"佇列中: {queue_count}")
+
+    def update_active_count(self):
+        active_count = len(self.active_processors)
+        self.active_count_label.setText(f"進行中: {active_count}")
+        # 同時更新批次模式的標籤
+        if hasattr(self, 'batch_active_count_label'):
+            self.batch_active_count_label.setText(f"進行中: {active_count}")
 
     def clear_finished_jobs(self):
         # 清除模型內已完成/取消/錯誤之項目
@@ -1487,6 +1999,71 @@ class VideoEditorFFApp(QMainWindow):
     def toggle_preview_group(self):
         if hasattr(self, 'preview_group') and self.preview_group:
             self.preview_group.setVisible(self.chk_show_preview.isChecked())
+
+    # ==================== 批次模式方法 ====================
+    
+    def on_batch_scan(self):
+        """批次掃描檔案"""
+        result = self.batch_settings.scan_files()
+        if result:
+            matched_pairs, output_folder = result
+            self.current_matched_pairs = matched_pairs
+            
+            if matched_pairs:
+                self.batch_preview.update_preview(matched_pairs, output_folder)
+                self.batch_process_btn.setEnabled(True)
+                self.batch_process_btn.setText(f"🚀 開始批次處理 ({len(matched_pairs)} 個檔案)")
+                # 移除確認對話窗，讓操作更流暢
+            else:
+                self.batch_preview.update_preview([], "")
+                self.batch_process_btn.setEnabled(False)
+                QMessageBox.warning(self, "掃描結果", "未找到可匹配的檔案")
+        else:
+            QMessageBox.warning(self, "掃描失敗", "請先選擇所有必要的資料夾")
+
+    def start_batch_processing(self):
+        """開始批次處理"""
+        if not self.current_matched_pairs:
+            QMessageBox.warning(self, "警告", "請先掃描檔案")
+            return
+        
+        # 建立批次
+        batch_id = self.batch_manager.create_batch(self.current_matched_pairs, self.batch_settings.output_folder)
+        
+        # 將所有工作加入佇列
+        batch_jobs = self.batch_manager.get_current_batch()
+        for job in batch_jobs:
+            # 批次模式固定使用相同的圖片作為開頭和結尾，固定3秒
+            processor_args = {
+                'job_id': job.job_id,
+                'video_file': job.video_path,
+                'start_image': job.image_path,
+                'end_image': job.image_path,  # 同圖
+                'start_duration': 3.0,  # 固定3秒
+                'end_duration': 3.0,    # 固定3秒
+                'output_file': job.output_path,
+                'prefer_copy_concat': self.prefer_copy_concat,
+                'use_hardware': self.use_hardware,
+                'env': self.env,
+            }
+            
+            # 加入佇列
+            self.job_queue.append(processor_args)
+            
+            # 加入模型
+            job_name = f"批次: {os.path.basename(job.video_path)}"
+            job_item = JobItem(job.job_id, job_name)
+            self.jobs_model.add_item(job_item)
+            self.jobs_model.set_state(job.job_id, "queued", "已加入佇列…")
+        
+        self.update_queue_count()
+        self.process_next_in_queue()
+        
+        # 禁用批次處理按鈕
+        self.batch_process_btn.setEnabled(False)
+        self.batch_process_btn.setText("處理中...")
+        
+        # 移除確認對話窗，讓操作更流暢
 
     def closeEvent(self, event):
         if self.active_processors:
