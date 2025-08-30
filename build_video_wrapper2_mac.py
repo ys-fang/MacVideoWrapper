@@ -89,7 +89,10 @@ class VideoWrapper2MacBuilder:
         print("📝 建立 PyInstaller spec 檔案...")
         
         # 檢查圖示檔案
-        icon_path = self.assets_dir / "mac" / "app_icon.icns"
+        icon_path = self.assets_dir / "mac" / "videowrapper2.icns"
+        if not icon_path.exists():
+            # 如果新圖示不存在，使用舊圖示
+            icon_path = self.assets_dir / "mac" / "app_icon.icns"
         icon_param = f"'{icon_path}'" if icon_path.exists() else "None"
         
         spec_content = f'''# -*- mode: python ; coding: utf-8 -*-
