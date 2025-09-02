@@ -19,6 +19,7 @@ import uuid
 import glob
 from datetime import datetime
 from typing import List, Tuple, Dict, Optional
+from pathlib import Path
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QFileDialog, QVBoxLayout, QHBoxLayout,
@@ -396,75 +397,204 @@ class BatchSettingsPanel(QWidget):
 
 class FFmpegEnv:
     def __init__(self):
-        embedded_ffmpeg_candidates = self._embedded_candidates('ffmpeg')
-        embedded_ffprobe_candidates = self._embedded_candidates('ffprobe')
-        self.ffmpeg_path = self._find_binary('FFMPEG_BIN', embedded_ffmpeg_candidates + ['ffmpeg', '/opt/homebrew/bin/ffmpeg', '/usr/local/bin/ffmpeg'])
-        self.ffprobe_path = self._find_binary('FFPROBE_BIN', embedded_ffprobe_candidates + ['ffprobe', '/opt/homebrew/bin/ffprobe', '/usr/local/bin/ffprobe'])
-        self.hardware_encoders = self._detect_hardware_encoders()
+        # 1. 獲取內建二進制檔案的候選路徑 (只包含存在的)
+        embedded_ffmpeg_candidates = self._get_embedded_binaries('ffmpeg')
+        embedded_ffprobe_candidates = self._get_embedded_binaries('ffprobe')
 
-    def _find_binary(self, env_key, candidates):
-        env_val = os.environ.get(env_key)
-        if env_val and os.path.exists(env_val):
-            return env_val
-        for c in candidates:
-            try:
-                res = subprocess.run([c, '-version'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-                if res.returncode == 0:
-                    return c
-            except Exception:
-                continue
-        return candidates[0]
+        # 2. 定義系統二進制檔案的候選路徑
+        system_ffmpeg_candidates = ['/opt/homebrew/bin/ffmpeg', '/usr/local/bin/ffmpeg', 'ffmpeg']
+        system_ffprobe_candidates = ['/opt/homebrew/bin/ffprobe', '/usr/local/bin/ffprobe', 'ffprobe']
+
+        # 3. 按照明確的優先級尋找 FFmpeg 和 FFprobe
+        self.ffmpeg_path = self._find_binary_with_priority(
+            'FFMPEG_BIN',
+            embedded_ffmpeg_candidates,
+            system_ffmpeg_candidates
+        )
+        self.ffprobe_path = self._find_binary_with_priority(
+            'FFPROBE_BIN',
+            embedded_ffprobe_candidates,
+            system_ffprobe_candidates
+        )
+        self.hardware_encoders = self._detect_hardware_encoders()
+        
+        # 記錄路徑信息用於調試
+        self.ffmpeg_source = self._get_binary_source_info(self.ffmpeg_path, embedded_ffmpeg_candidates)
+        self.ffprobe_source = self._get_binary_source_info(self.ffprobe_path, embedded_ffprobe_candidates)
 
     def _app_base_dir(self):
-        # PyInstaller 打包後：有 sys._MEIPASS；.app 中通常在 Contents/MacOS
-        try:
-            if hasattr(sys, '_MEIPASS') and sys._MEIPASS:
-                return sys._MEIPASS
-        except Exception:
-            pass
-        # frozen one-dir 下，sys.executable 指向可執行檔
-        try:
-            if getattr(sys, 'frozen', False):
-                return os.path.dirname(os.path.abspath(sys.executable))
-        except Exception:
-            pass
+        """獲取應用程式基礎目錄，優先考慮 .app 結構 (增強穩健性)"""
+        # PyInstaller 打包後：有 sys._MEIPASS
+        if hasattr(sys, '_MEIPASS') and sys._MEIPASS:
+            print(f"DEBUG: _MEIPASS 存在: {sys._MEIPASS}")
+            return sys._MEIPASS
+        
+        # frozen 狀態下的 .app 結構
+        if getattr(sys, 'frozen', False):
+            executable_path = Path(sys.executable).resolve()
+            print(f"DEBUG: frozen 狀態, executable_path: {executable_path}")
+            # 向上查找 .app 目錄
+            for parent in executable_path.parents:
+                if parent.suffix == '.app':
+                    app_root = parent
+                    contents_dir = app_root / 'Contents'
+                    print(f"DEBUG: 檢測到 .app 根目錄: {app_root}, Contents 目錄: {contents_dir}")
+                    if contents_dir.is_dir():
+                        return str(contents_dir)
+            # 如果沒有找到 .app 結構，返回可執行檔的目錄
+            print(f"DEBUG: 未在 frozen 狀態下找到 .app 結構，返回可執行檔目錄: {executable_path.parent}")
+            return str(executable_path.parent)
+        
         # 開發模式：以此檔所在目錄為基準
-        try:
-            return os.path.dirname(os.path.abspath(__file__))
-        except Exception:
-            return os.getcwd()
+        current_file_dir = Path(__file__).resolve().parent
+        print(f"DEBUG: 開發模式, 當前檔案目錄: {current_file_dir}")
+        return str(current_file_dir)
 
-    def _embedded_candidates(self, bin_name):
-        base = self._app_base_dir()
-        candidates = []
-        # 優先：assets/bin/mac/arm64
-        candidates.append(os.path.join(base, 'assets', 'bin', 'mac', 'arm64', bin_name))
-        # 次要：assets/bin
-        candidates.append(os.path.join(base, 'assets', 'bin', bin_name))
-        # 有些佈局可能把資源放到 Resources 或 _internal；一併嘗試。
-        # .app 內從 MacOS/ 退回到 Contents/
-        app_contents = os.path.abspath(os.path.join(base, '..'))
-        resources_dir = os.path.join(app_contents, 'Resources')
-        internal_dir = os.path.join(app_contents, '_internal')
-        candidates.append(os.path.join(resources_dir, 'assets', 'bin', 'mac', 'arm64', bin_name))
-        candidates.append(os.path.join(resources_dir, 'assets', 'bin', bin_name))
-        candidates.append(os.path.join(internal_dir, 'assets', 'bin', 'mac', 'arm64', bin_name))
-        candidates.append(os.path.join(internal_dir, 'assets', 'bin', bin_name))
-        # 僅返回存在或可執行的路徑優先，其餘也保留以便 _find_binary 嘗試
-        # 這裡不過濾，交由 _find_binary 一次測試 -version 判斷
-        return candidates
+    def _get_embedded_binaries(self, bin_name) -> List[str]:
+        """獲取內建二進制檔案的路徑候選，並只返回實際存在的路徑 (增強穩健性)"""
+        base = Path(self._app_base_dir())
+        potential_candidates = []
+        print(f"DEBUG: _get_embedded_binaries 基礎目錄: {base}")
+
+        # 情況 1: .app/Contents 結構
+        if base.name == 'Contents' and base.parent.suffix == '.app':
+            resources_dir = base / 'Resources'
+            if resources_dir.is_dir():
+                print(f"DEBUG: .app/Contents/Resources 目錄存在: {resources_dir}")
+                # 優先：Resources/assets/bin/mac/arm64
+                potential_candidates.append(resources_dir / 'assets' / 'bin' / 'mac' / 'arm64' / bin_name)
+                # 次要：Resources/assets/bin/mac
+                potential_candidates.append(resources_dir / 'assets' / 'bin' / 'mac' / bin_name)
+                # 第三：Resources/assets/bin
+                potential_candidates.append(resources_dir / 'assets' / 'bin' / bin_name)
+        
+        # 情況 2: _MEIPASS 結構 (例如 one-file 模式或某些打包)
+        elif hasattr(sys, '_MEIPASS') and sys._MEIPASS:
+            meipass_base = Path(sys._MEIPASS)
+            print(f"DEBUG: _MEIPASS 結構, 基礎目錄: {meipass_base}")
+            potential_candidates.append(meipass_base / 'assets' / 'bin' / 'mac' / 'arm64' / bin_name)
+            potential_candidates.append(meipass_base / 'assets' / 'bin' / 'mac' / bin_name)
+            potential_candidates.append(meipass_base / 'assets' / 'bin' / bin_name)
+
+        # 情況 3: 開發模式或其他非標準 frozen 情況
+        else:
+            # 嘗試從當前檔案路徑相對構建
+            current_file_dir = Path(__file__).resolve().parent
+            print(f"DEBUG: 開發模式/非標準 frozen, 嘗試從 {current_file_dir} 構建路徑")
+            potential_candidates.append(current_file_dir / 'assets' / 'bin' / 'mac' / 'arm64' / bin_name)
+            potential_candidates.append(current_file_dir / 'assets' / 'bin' / 'mac' / bin_name)
+            potential_candidates.append(current_file_dir / 'assets' / 'bin' / bin_name)
+            
+            # 最終 fallback：如果這些都失敗，也嘗試從 _internal/assets
+            # 這裡需要更小心，因為 _internal 通常在 .app/Contents 下，但 _MEIPASS 或 frozen 狀態可能不同
+            app_root_from_executable = Path(sys.executable).resolve().parent
+            for parent in app_root_from_executable.parents:
+                if parent.name == 'Contents':
+                    internal_path = parent / '_internal'
+                    if internal_path.is_dir():
+                        print(f"DEBUG: 嘗試 _internal 路徑: {internal_path}")
+                        potential_candidates.append(internal_path / 'assets' / 'bin' / 'mac' / 'arm64' / bin_name)
+                        potential_candidates.append(internal_path / 'assets' / 'bin' / 'mac' / bin_name)
+                        potential_candidates.append(internal_path / 'assets' / 'bin' / bin_name)
+                    break
+
+        # 過濾掉不存在的路徑，只保留實際存在的
+        existing_candidates = []
+        for p in potential_candidates:
+            if p.is_file() and os.access(p, os.X_OK):
+                existing_candidates.append(str(p))
+                print(f"DEBUG: 找到並可執行內建候選: {p}")
+            elif p.is_file():
+                print(f"DEBUG: 找到但不可執行內建候選: {p}")
+            else:
+                print(f"DEBUG: 內建候選不存在: {p}")
+
+        return existing_candidates
+
+    def _find_binary_with_priority(self, env_key: str, embedded_candidates: List[str], system_candidates: List[str]) -> Optional[str]:
+        """按照明確的優先級尋找二進制檔案：環境變數 -> 內建 -> 系統"""
+        print(f"DEBUG: 正在尋找 {env_key} (優先級: 環境變數 -> 內建 -> 系統)")
+        # 1. 檢查環境變數
+        env_val = os.environ.get(env_key)
+        if env_val:
+            print(f"DEBUG: 檢查環境變數 {env_key}={env_val}")
+            if Path(env_val).is_file() and os.access(env_val, os.X_OK):
+                try:
+                    res = subprocess.run([env_val, '-version'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=True)
+                    print(f"DEBUG: ✅ 環境變數 {env_key} 指向的二進制檔案可用: {env_val}")
+                    return env_val
+                except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                    print(f"DEBUG: ❌ 環境變數 {env_key} 指向的二進制檔案執行失敗或找不到: {env_val} - {e}")
+            else:
+                print(f"DEBUG: 環境變數 {env_key} 指向的檔案不存在或不可執行: {env_val}")
+
+        # 2. 檢查內建候選路徑
+        print(f"DEBUG: 檢查內建候選路徑: {embedded_candidates}")
+        for c in embedded_candidates:
+            if Path(c).is_file() and os.access(c, os.X_OK):
+                try:
+                    res = subprocess.run([c, '-version'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=True)
+                    print(f"DEBUG: ✅ 內建二進制檔案可用: {c}")
+                    return c
+                except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                    print(f"DEBUG: ❌ 內建二進制檔案執行失敗或找不到: {c} - {e}")
+            else:
+                print(f"DEBUG: 內建二進制檔案不存在或不可執行: {c}")
+
+        # 3. 檢查系統候選路徑
+        print(f"DEBUG: 檢查系統候選路徑: {system_candidates}")
+        for c in system_candidates:
+            current_path = Path(c)
+            if not current_path.is_absolute(): # 處理相對路徑 (e.g. 'ffmpeg')
+                try:
+                    which_result = subprocess.run(['which', c], capture_output=True, text=True, check=True)
+                    full_path = which_result.stdout.strip()
+                    if full_path:
+                        current_path = Path(full_path)
+                        print(f"DEBUG: 'which {c}' 找到路徑: {current_path}")
+                except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                    print(f"DEBUG: 'which {c}' 執行失敗或找不到: {e}")
+                    continue
+            
+            if current_path.is_file() and os.access(current_path, os.X_OK):
+                try:
+                    res = subprocess.run([str(current_path), '-version'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=True)
+                    print(f"DEBUG: ✅ 系統二進制檔案可用: {current_path}")
+                    return str(current_path)
+                except (subprocess.CalledProcessError, FileNotFoundError) as e:
+                    print(f"DEBUG: ❌ 系統二進制檔案執行失敗或找不到: {current_path} - {e}")
+            else:
+                print(f"DEBUG: 系統二進制檔案不存在或不可執行: {current_path}")
+
+        print(f"DEBUG: ❌ 未找到 {env_key} 的可用二進制檔案")
+        return None
+
+    def _get_binary_source_info(self, found_path: Optional[str], embedded_candidates: List[str]) -> str:
+        """判斷找到的二進制檔案來源"""
+        if not found_path:
+            return "未找到"
+        if found_path in embedded_candidates:
+            return f"內建 ({os.path.basename(found_path)})"
+        # 檢查是否為系統路徑
+        if '/opt/homebrew/bin/' in found_path or '/usr/local/bin/' in found_path or os.path.basename(found_path) in ['ffmpeg', 'ffprobe']:
+            return f"系統 ({found_path})"
+        return f"其他 ({found_path})"
 
     def _detect_hardware_encoders(self):
         enc = []
         try:
-            p = subprocess.run([self.ffmpeg_path, '-hide_banner', '-encoders'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-            out = p.stdout or ''
-            if 'h264_videotoolbox' in out:
-                enc.append('h264_videotoolbox')
-            if 'hevc_videotoolbox' in out:
-                enc.append('hevc_videotoolbox')
-        except Exception:
-            pass
+            # 在嘗試執行之前，先檢查路徑是否存在且可執行
+            if self.ffmpeg_path and os.path.exists(self.ffmpeg_path) and os.access(self.ffmpeg_path, os.X_OK):
+                p = subprocess.run([self.ffmpeg_path, '-hide_banner', '-encoders'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                out = p.stdout or ''
+                if 'h264_videotoolbox' in out:
+                    enc.append('h264_videotoolbox')
+                if 'hevc_videotoolbox' in out:
+                    enc.append('hevc_videotoolbox')
+            else:
+                print(f"警告: FFmpeg 路徑不可用或不可執行: {self.ffmpeg_path}")
+        except Exception as e:
+            print(f"檢測硬體編碼器時發生錯誤: {e}")
         return enc
 
 
@@ -1077,6 +1207,9 @@ class VideoEditorFFApp(QMainWindow):
 
         self.update_active_count()
         self.update_queue_count()
+        
+        # 更新 FFmpeg 狀態顯示
+        self.update_ffmpeg_status()
 
     def create_tab_widget(self):
         """創建標籤頁容器"""
@@ -1449,6 +1582,34 @@ class VideoEditorFFApp(QMainWindow):
         options_layout.addWidget(self.auto_output_checkbox)
         
         vbox.addWidget(options_group)
+
+        # FFmpeg 狀態顯示區塊
+        ffmpeg_group = QWidget()
+        ffmpeg_group.setObjectName("FunctionGroup")
+        ffmpeg_layout = QVBoxLayout(ffmpeg_group)
+        ffmpeg_layout.setSpacing(4)
+        
+        ffmpeg_title = QLabel("🔧 FFmpeg 狀態")
+        ffmpeg_title.setObjectName("SectionTitle")
+        ffmpeg_layout.addWidget(ffmpeg_title)
+        
+        # FFmpeg 狀態
+        self.ffmpeg_status_label = QLabel("FFmpeg: 檢查中...")
+        self.ffmpeg_status_label.setStyleSheet("color: #ff9800; font-size: 12px;")
+        ffmpeg_layout.addWidget(self.ffmpeg_status_label)
+        
+        # FFprobe 狀態
+        self.ffprobe_status_label = QLabel("FFprobe: 檢查中...")
+        self.ffprobe_status_label.setStyleSheet("color: #ff9800; font-size: 12px;")
+        ffmpeg_layout.addWidget(self.ffprobe_status_label)
+        
+        # 路徑信息
+        self.ffmpeg_path_label = QLabel("路徑: 載入中...")
+        self.ffmpeg_path_label.setStyleSheet("color: #888; font-size: 10px; font-family: monospace;")
+        self.ffmpeg_path_label.setWordWrap(True)
+        ffmpeg_layout.addWidget(self.ffmpeg_path_label)
+        
+        vbox.addWidget(ffmpeg_group)
 
         # 狀態與資訊區塊
         info_group = QWidget()
@@ -1861,6 +2022,50 @@ class VideoEditorFFApp(QMainWindow):
         # 同時更新批次模式的標籤
         if hasattr(self, 'batch_active_count_label'):
             self.batch_active_count_label.setText(f"進行中: {active_count}")
+
+    def update_ffmpeg_status(self):
+        """更新 FFmpeg 狀態顯示"""
+        try:
+            # 更新 FFmpeg 狀態
+            if hasattr(self.env, 'ffmpeg_source'):
+                if "內建" in self.env.ffmpeg_source:
+                    self.ffmpeg_status_label.setText(f"FFmpeg: ✅ {self.env.ffmpeg_source}")
+                    self.ffmpeg_status_label.setStyleSheet("color: #4caf50; font-size: 12px;")
+                elif "系統" in self.env.ffmpeg_source:
+                    self.ffmpeg_status_label.setText(f"FFmpeg: ⚠️ {self.env.ffmpeg_source}")
+                    self.ffmpeg_status_label.setStyleSheet("color: #ff9800; font-size: 12px;")
+                else:
+                    self.ffmpeg_status_label.setText(f"FFmpeg: ❌ {self.env.ffmpeg_source}")
+                    self.ffmpeg_status_label.setStyleSheet("color: #f44336; font-size: 12px;")
+            
+            # 更新 FFprobe 狀態
+            if hasattr(self.env, 'ffprobe_source'):
+                if "內建" in self.env.ffprobe_source:
+                    self.ffprobe_status_label.setText(f"FFprobe: ✅ {self.env.ffprobe_source}")
+                    self.ffprobe_status_label.setStyleSheet("color: #4caf50; font-size: 12px;")
+                elif "系統" in self.env.ffprobe_source:
+                    self.ffprobe_status_label.setText(f"FFprobe: ⚠️ {self.env.ffprobe_source}")
+                    self.ffprobe_status_label.setStyleSheet("color: #ff9800; font-size: 12px;")
+                else:
+                    self.ffprobe_status_label.setText(f"FFprobe: ❌ {self.env.ffprobe_source}")
+                    self.ffprobe_status_label.setStyleSheet("color: #f44336; font-size: 12px;")
+            
+            # 更新路徑信息
+            path_info = []
+            if hasattr(self.env, 'ffmpeg_path') and self.env.ffmpeg_path:
+                path_info.append(f"FFmpeg: {self.env.ffmpeg_path}")
+            if hasattr(self.env, 'ffprobe_path') and self.env.ffprobe_path:
+                path_info.append(f"FFprobe: {self.env.ffprobe_path}")
+            
+            if path_info:
+                self.ffmpeg_path_label.setText("路徑:\n" + "\n".join(path_info))
+            else:
+                self.ffmpeg_path_label.setText("路徑: 未找到")
+                
+        except Exception as e:
+            self.ffmpeg_status_label.setText(f"FFmpeg: ❌ 錯誤")
+            self.ffprobe_status_label.setText(f"FFprobe: ❌ 錯誤")
+            self.ffmpeg_path_label.setText(f"路徑: 錯誤 - {str(e)}")
 
     def clear_finished_jobs(self):
         # 清除模型內已完成/取消/錯誤之項目
